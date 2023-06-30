@@ -3,31 +3,35 @@ using ESI.NET.Enumerations;
 using ESI.NET.Models.Market;
 using ESI.NET.Models.SSO;
 using EveMarketBot;
+using EveMarketBot.Adam4EveApi;
 using EveMarketBot.EvePraisalApi;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Data.SQLite;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Web;
 
 namespace EveMarketBot
 {
-    public class Worker : IHostedService
+    public class Worker : BackgroundService
     {
         ILogger<Worker> Logger { get; set; }
-        const string itemsQuery = "SELECT DISTINCT invTypes.typeID,invTypes.typeName FROM invTypes INNER JOIN invGroups ON invGroups.groupID = invTypes.groupID INNER JOIN invCategories ON invCategories.categoryID = invGroups.categoryID WHERE metaGroupID IN(1,2,14) AND invGroups.categoryID NOT IN(2,9,11,17,23,25,30,41,63,65,66,87,91) AND invTypes.marketGroupID IS NOT NULL;";
-        const string dbPath = @"C:\Users\Kat\Downloads\sde\sde.sqlite";
 
+        const int numRetries = 3;
+        const int theForgeRegionId = 10000002;
         const int essenceRegionId = 10000064;
-
         const long heydielesHqId = 1039723362469;
+        const string stockListsJsonPath = "stockLists.json";
+
         IEsiClient esiClient;
         public Worker(IEsiClient client, ILogger<Worker> logger)
         {
@@ -35,29 +39,21 @@ namespace EveMarketBot
             Logger = logger;
         }
 
-        public static HttpListener listener;
-        public static string url = "http://localhost:8080/";
-        public static int pageViews = 0;
-        public static int requestCount = 0;
-        public static string pageData =
-            "<!DOCTYPE>" +
-            "<html>" +
-            "  <head>" +
-            "    <title>HttpListener Example</title>" +
-            "  </head>" +
-            "  <body>" +
-            "    <p>Page Views: {0}</p>" +
-            "    <form method=\"post\" action=\"shutdown\">" +
-            "      <input type=\"submit\" value=\"Shutdown\" {1}>" +
-            "    </form>" +
-            "  </body>" +
-            "</html>";
-
-
-        public static async Task<string> ReceiveSsoCallback()
+        public static async Task<AuthorizedCharacterData?> AuthorizeSSO(IEsiClient esiClient)
         {
+            const string callbackUrl = "http://localhost:8080/";
+            var listener = new HttpListener();
+            listener.Prefixes.Add(callbackUrl);
+            listener.Start();
+            string state = "BLAH";
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = esiClient.SSO.CreateAuthenticationUrl(new List<string>() { "publicData", "esi-markets.structure_markets.v1" }, state),
+                UseShellExecute = true
+            });
             bool runServer = true;
 
+            string? ssoResponse = null;
             // While a user hasn't visited the `shutdown` url, keep on handling requests
             while (runServer)
             {
@@ -65,22 +61,31 @@ namespace EveMarketBot
                 HttpListenerContext ctx = await listener.GetContextAsync();
 
                 // If `shutdown` url requested w/ POST, then shutdown the server after serving the page
-                if (ctx.Request.HttpMethod == "GET" && ctx.Request.Url.AbsolutePath == "/callback")
+                if (ctx.Request.HttpMethod == "GET" && ctx.Request.Url?.AbsolutePath == "/callback")
                 {
                     var pairs = HttpUtility.ParseQueryString(ctx.Request.Url.Query);
-                    string output = string.Empty;
-                    if(pairs != null) output = pairs["code"];
-                    string responseString = "<HTML><BODY> Congratulations! You've logged in! Heydieles market bot liked that.!</BODY></HTML>";
+                    if(pairs != null) ssoResponse = pairs["code"];
+                    string responseString = "<HTML><BODY> Congratulations! You've logged in! EveMarketBot liked that!</BODY></HTML>";
                     byte[] buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
                     // Get a response stream and write the response to it.
                     ctx.Response.ContentLength64 = buffer.Length;
                     ctx.Response.OutputStream.Write(buffer, 0, buffer.Length);
                     // You must close the output stream.
                     ctx.Response.OutputStream.Close();
-                    return output;
+                    break;
                 }
             }
-            return string.Empty;
+
+            listener.Stop();
+            listener.Close();
+            if (ssoResponse != null)
+            {
+                SsoToken token = await esiClient.SSO.GetToken(GrantType.AuthorizationCode, ssoResponse);
+                AuthorizedCharacterData characterData = await esiClient.SSO.Verify(token);
+                esiClient.SetCharacterData(characterData);
+                return characterData;
+            }
+            return null;
         }
 
         public static void PopulateUserAgent(HttpRequestHeaders headers)
@@ -94,36 +99,287 @@ namespace EveMarketBot
             headers.UserAgent.Add(new ProductInfoHeaderValue("Safari", "537.36"));
         }
 
-        public async Task StartAsync(CancellationToken cancellationToken)
+        async Task<string[]> IfNotFileExistsDownload(HttpClient client, string fileName)
         {
-            listener = new HttpListener();
-            listener.Prefixes.Add(url);
-            listener.Start();
-            string state = "blah";
-            Process.Start(new ProcessStartInfo
+            if (!File.Exists(Environment.CurrentDirectory + fileName))
             {
-                FileName = esiClient.SSO.CreateAuthenticationUrl(new List<string>() { "publicData", "esi-markets.structure_markets.v1" }, state),
-                UseShellExecute = true
-            });
-            string ssoResponse = await ReceiveSsoCallback();
-            Console.WriteLine(ssoResponse);
-            listener.Stop();
-            listener.Close();
+                HttpResponseMessage? req = await client.GetAsync("/MarketPricesRegionHistory/2023" + fileName);
+                if (req == null || req.StatusCode != HttpStatusCode.OK)
+                {
+                    return new string[0];
+                }
+                File.WriteAllBytes(Environment.CurrentDirectory + fileName, await req.Content.ReadAsByteArrayAsync());
+            }
+            return File.ReadAllLines(Environment.CurrentDirectory + fileName);
+        }
 
-            SsoToken token = await esiClient.SSO.GetToken(GrantType.AuthorizationCode, ssoResponse);
-            AuthorizedCharacterData characterData = await esiClient.SSO.Verify(token);
-            esiClient.SetCharacterData(characterData);
+        protected override async Task ExecuteAsync(CancellationToken cancellationToken)
+        {
+            Dictionary<int, StockedItem> requestedItems = GetManufacturableItemsFromSde();
+            //List<StockList> stockLists = GetStockListsFromJson(out DateTime lastStockRequestTime);
+            DateTime nextStockRequestTime = DateTime.Now;
+            DateTime nextHistoryReqStartTime = DateTime.Now;
+            var authedCharacter = await AuthorizeSSO(esiClient);
+            if (authedCharacter == null)
+            {
+                Console.WriteLine("Failed to authorize SSO!");
+                return;
+            }
+            TimeSpan oneHourTimeSpan = new TimeSpan(1, 0, 0);
+            TimeSpan oneDayTimeSpan = new TimeSpan(1, 0, 0, 0);
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if(DateTime.Now >= nextHistoryReqStartTime)
+                {
+                    nextHistoryReqStartTime += oneDayTimeSpan;
+                    DateTime rateLimitExpireTime = DateTime.Now + new TimeSpan(0, 1, 0);
+                    int numRequests = 0;
+                    foreach (var reqItem in requestedItems.Values)
+                    {
+                        var resp = await esiClient.Market.TypeHistoryInRegion(essenceRegionId, reqItem.TypeId);
+                        numRequests++;
+                        WaitIfRateLimited(ref numRequests, ref rateLimitExpireTime);
+                        if (resp.StatusCode == HttpStatusCode.InternalServerError)
+                        {
+                            // rate limited? wait a minute
+                            await Task.Delay(61000);
+                            resp = await esiClient.Market.TypeHistoryInRegion(essenceRegionId, reqItem.TypeId);
+                            numRequests++;
+                            WaitIfRateLimited(ref numRequests, ref rateLimitExpireTime);
+                        }
+                        if(resp.StatusCode == HttpStatusCode.OK)
+                        {
+                            var marketStats = resp.Data.OrderByDescending(dd => dd.Date).ToList();
+                            long weekVolume = 0;
+                            for(int i =0; i < 7 && i < marketStats.Count; i++)
+                            {
+                                weekVolume += marketStats[i].Volume;
+                            }
+                            reqItem.VolumePerDay = weekVolume / 7;
+                        }
+                        else if(resp.StatusCode == HttpStatusCode.NotFound)
+                        {
+                            continue;
+                        }
+                        else
+                        {
+                            await Task.Delay(60000, cancellationToken);
+                        }
+                        reqItem.VolumePerDay = 0;
+                    }
+                }
+                if (DateTime.Now >= nextStockRequestTime)
+                {
+                    await ReadJitaPricesFromAdam4Eve(requestedItems);
+                    nextStockRequestTime = DateTime.Now + oneHourTimeSpan;
+                    StockList stockList = new StockList() { Timestamp = DateTime.Now };
+
+                    SsoToken token = await esiClient.SSO.GetToken(GrantType.RefreshToken, authedCharacter.RefreshToken);
+                    authedCharacter = await esiClient.SSO.Verify(token);
+                    esiClient.SetCharacterData(authedCharacter);
+
+                    var orders = await ReadOrdersFromStructure(requestedItems, heydielesHqId);
+                    if (orders == null)
+                    {
+                        Console.WriteLine("Failed to query orders");
+                        Thread.Sleep(10000);
+                        continue;
+                    }
+                    foreach (var structOrder in orders)
+                    {
+                        if (!structOrder.IsBuyOrder)
+                        {
+                            if (requestedItems.TryGetValue(structOrder.TypeId, out StockedItem? stockedItem) && stockedItem != null)
+                            {
+                                if (structOrder.Price < stockedItem.MinimumPrice)
+                                {
+                                    stockedItem.MinimumPrice = structOrder.Price;
+                                }
+                                int totalStock = structOrder.VolumeRemain;
+                                if (stockList.StockCountsByTypeId.TryGetValue(structOrder.TypeId, out var stockCount))
+                                {
+                                    totalStock += stockCount;
+                                }
+                                stockList.StockCountsByTypeId[structOrder.TypeId] = totalStock;
+                            }
+                        }
+                    }
+                    WriteMarketReport(requestedItems, stockList);
+                    //AddNewStockList(requestedItems, stockLists, threeDayTimeSpan, stockList);
+                    //if (stockLists.Count > 1)
+                    //{
+                    //    CalculateEstimatedTradingVolume(requestedItems, stockLists);
+
+                    //    WriteMarketReport(requestedItems, stockList);
+                    //}
+                }
+                await Task.Delay(10000, cancellationToken);
+            }
+        }
+
+        void WaitIfRateLimited(ref int numRequests, ref DateTime rateLimitExpireTime)
+        {
+            if(numRequests >= 300 || DateTime.Now >= rateLimitExpireTime)
+            {
+                while (DateTime.Now <= rateLimitExpireTime)
+                {
+                    Thread.Sleep(1000);
+                }
+                rateLimitExpireTime = DateTime.Now + new TimeSpan(0, 1, 0);
+                numRequests = 0;
+            }
+        }
+
+        private static void CalculateEstimatedTradingVolume(Dictionary<int, StockedItem> requestedItems, List<StockList> stockLists)
+        {
+            for (int i = 1; i < stockLists.Count; i++)
+            {
+                foreach (var stockItem in stockLists[i - 1].StockCountsByTypeId)
+                {
+                    int newStock = 0;
+                    if (stockLists[i].StockCountsByTypeId.TryGetValue(stockItem.Key, out var newStockTmp))
+                    {
+                        newStock = newStockTmp;
+                    }
+                    int stockDelta = stockItem.Value - newStock; // old value minus new value = amount sold
+                    if (stockDelta > 0 && requestedItems.TryGetValue(stockItem.Key, out var stockedItem))
+                    {
+                        stockedItem.VolumePerDay += stockDelta;
+                    }
+                }
+            }
+            TimeSpan dataTimeLength = DateTime.Now.Subtract(stockLists.Min(sl => sl.Timestamp));
+            double divisor = new TimeSpan(1, 0, 0, 0) / dataTimeLength; // 24 hours divided by the length of time we have recorded equals the amount we need to multiply each data sample by in order to get # sold per day
+            foreach (var reqItem in requestedItems.Values)
+            {
+                reqItem.VolumePerDay = (long)(reqItem.VolumePerDay * divisor);
+            }
+        }
+
+        void AddNewStockList(Dictionary<int, StockedItem> requestedItems, List<StockList> stockLists, TimeSpan threeDayTimeSpan, StockList stockList)
+        {
+            stockLists.Add(stockList);
+            foreach (var stockItem in stockList.StockCountsByTypeId)
+            {
+                if (requestedItems.TryGetValue(stockItem.Key, out var stockedItem))
+                {
+                    stockedItem.CurrentStock = stockItem.Value;
+                }
+            }
+            for (int i = 0; i < stockLists.Count;)
+            {
+                if (DateTime.Now.Subtract(stockLists[i].Timestamp) > threeDayTimeSpan)
+                {
+                    stockLists.RemoveAt(i);
+                }
+                else
+                {
+                    i++;
+                }
+            }
+            File.WriteAllText(stockListsJsonPath, JsonSerializer.Serialize(stockLists));
+        }
+
+        List<StockList> GetStockListsFromJson(out DateTime lastStockRequestTime)
+        {
+            var stockLists = new List<StockList>();
+            lastStockRequestTime = DateTime.MinValue;
+            if (File.Exists(stockListsJsonPath))
+            {
+                stockLists = JsonSerializer.Deserialize<List<StockList>>(File.ReadAllText(stockListsJsonPath)) ?? new List<StockList>();
+                lastStockRequestTime = stockLists.Select(sl => sl.Timestamp).Max();
+            }
+            return stockLists;
+        }
+
+        private void WriteMarketReport(Dictionary<int, StockedItem> requestedItems, StockList stockList)
+        {
+            List<string[]> csvLines = new List<string[]>();
+            csvLines.Add(new string[] { "typeid", "name", "heyd_price", "jita_price", "heyd_stock", "stockvelocity", "saturation", "markup" });
+            foreach (var stockedItem in requestedItems.Values)
+            {
+                if (stockedItem.CurrentStock > 0 && stockedItem.JitaPrice > 0)
+                {
+                    decimal saturation = stockedItem.VolumePerDay / (decimal)stockedItem.CurrentStock;
+                    decimal markup = (stockedItem.MinimumPrice / (decimal)stockedItem.JitaPrice) * 100 - 100;
+                    csvLines.Add(new string[] { stockedItem.TypeId.ToString(), stockedItem.Name.ToString(), $"{stockedItem.MinimumPrice:0.00}", $"{stockedItem.JitaPrice:0.00}", stockedItem.CurrentStock.ToString(), stockedItem.VolumePerDay.ToString(), $"{saturation:0.0}", $"{markup:0.0}" });
+                }
+            }
+            Logger.LogInformation("Synced orders @ " + stockList.Timestamp.ToLongDateString() + " " + stockList.Timestamp.ToLongTimeString());
+            File.WriteAllLines("output.csv", csvLines.Select(tokens => string.Join(',', tokens)).ToArray());
+        }
+
+        private async Task<List<Order>?> ReadOrdersFromStructure(Dictionary<int, StockedItem> requestedItems, long structureId)
+        {
+            int numPages = 2;
+            List<Order> output = new List<Order>();
+            EsiResponse<List<Order>>? structOrdersResp = null;
+            for (int pageId = 1; pageId <= numPages; pageId++)
+            {
+                int retry = 0;
+                for (; retry < numRetries; retry++)
+                {
+                    structOrdersResp = await esiClient.Market.StructureOrders(structureId, pageId);
+                    if (structOrdersResp.StatusCode == HttpStatusCode.OK)
+                    {
+                        Thread.Sleep(100); // be nice to the server
+                        break;
+                    }
+                    else
+                    {
+                        Console.WriteLine("Waiting and repeating request...");
+                        Thread.Sleep(500); // be extra nice to the server
+                    }
+                }
+                if(retry >= numRetries || structOrdersResp == null)
+                {
+                    return null;
+                }
+                if (pageId == 1)
+                {
+                    numPages = structOrdersResp.Pages ?? 0;
+                }
+                output.AddRange(structOrdersResp.Data);
+            }
+            return output;
+        }
+
+        private async Task ReadJitaPricesFromAdam4Eve(Dictionary<int, StockedItem> requestedItems)
+        {
+            using (HttpClient client = new())
+            {
+                client.BaseAddress = new Uri("https://static.adam4eve.eu");
+                PopulateUserAgent(client.DefaultRequestHeaders);
+                var dayTimeSpan = new TimeSpan(1, 0, 0, 0);
+                DateTime currentDateTime = DateTime.Now.Subtract(dayTimeSpan);
+
+                int i = 0;
+                string fileName = $"/marketPrice_{theForgeRegionId}_daily_{currentDateTime:yyyy-MM-dd}.csv";
+                string[] lines = await IfNotFileExistsDownload(client, fileName);
+                for (i = 1; i < lines.Length; i++)
+                {
+                    MarketPriceRow prices = MarketPriceRow.CreateFromCsv(lines[i].Split(';'));
+
+                    if (prices.SellPriceLow != null && requestedItems.TryGetValue(prices.TypeId, out var stockedItem))
+                    {
+                        stockedItem.JitaPrice = (double)(decimal)prices.SellPriceLow;
+                    }
+                }
+                fileName = $"/marketPrice_{theForgeRegionId}_daily_{currentDateTime.Subtract(dayTimeSpan):yyyy-MM-dd}.csv";
+                if (File.Exists(fileName)) File.Delete(fileName);
+            }
+        }
+
+        private static Dictionary<int, StockedItem> GetManufacturableItemsFromSde()
+        {
+            const string itemsQuery = "SELECT invTypes.typeID,invTypes.typeName FROM invTypes INNER JOIN invGroups ON invGroups.groupID = invTypes.groupID INNER JOIN invCategories ON invCategories.categoryID = invGroups.categoryID WHERE (metaGroupID IS NULL OR metaGroupID NOT IN (3,4,5,6)) AND invGroups.categoryID NOT IN(2,9,11,17,23,30,41,63,65,66,87,91) AND invTypes.marketGroupID IS NOT NULL;";
+            const string dbPath = @"C:\Users\Kat\Downloads\sde\sde.sqlite";
 
             SQLiteConnection conn = new SQLiteConnection(new SQLiteConnectionStringBuilder() { DataSource = dbPath, ReadOnly = true }.ToString());
 
             conn.Open();
             Dictionary<int, StockedItem> requestedItems = new Dictionary<int, StockedItem>();
 
-            StructuredRequest strucReq = new StructuredRequest()
-            {
-                market_name = "jita",
-                persist = false
-            };
             using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = itemsQuery;
@@ -132,161 +388,11 @@ namespace EveMarketBot
                 {
                     int typeId = reader.GetInt32(0);
                     string name = reader.GetString(1);
-                    requestedItems.Add(typeId, new StockedItem() { TypeId = typeId, Name = name, MinimumPrice = decimal.MaxValue, StockCount = 0 });
-                    strucReq.items.Add(new ItemRequest()
-                    {
-                        type_id = typeId
-                    });
-                }
-            }
-
-            using (HttpClient client = new())
-            {
-                client.BaseAddress = new Uri("https://evepraisal.com");
-                var request = new HttpRequestMessage(HttpMethod.Post, "/appraisal/structured.json");
-                PopulateUserAgent(request.Headers);
-
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/html"));
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/xhtml+xml"));
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("image/webp"));
-
-                request.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
-                request.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
-                request.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("br"));
-                request.Content = JsonContent.Create(strucReq); //new StringContent("{\"market_name\": \"jita\", \"items\": [{\"name\": \"Rifter\"}, {\"type_id\": 34}], \"persist\":\"no\"}");
-                var evepraisalResponse = await client.SendAsync(request);
-                if (evepraisalResponse.StatusCode == System.Net.HttpStatusCode.OK)
-                {
-                    using (var stream = evepraisalResponse.Content.ReadAsStream())
-                    using (var gzipStream = new GZipStream(stream, CompressionMode.Decompress))
-                    {
-                        StructuredResponse? strucResp = JsonSerializer.Deserialize<StructuredResponse>(gzipStream);
-                        if (strucResp != null)
-                        {
-                            foreach(var strucItem in strucResp.appraisal.items)
-                            {
-                                if(requestedItems.TryGetValue(strucItem.typeID, out var stockedItem))
-                                {
-                                    stockedItem.JitaPrice = strucItem.prices.sell.min;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            //foreach (var stockedItem in new List<StockedItem>(requestedItems.Values))
-            //{
-            //    EsiResponse<List<Statistic>> typeStats = new EsiResponse<List<Statistic>>(new HttpResponseMessage() { StatusCode = HttpStatusCode.BadRequest }, "");
-            //    while (typeStats.StatusCode != HttpStatusCode.OK)
-            //    {
-            //        typeStats = await esiClient.Market.TypeHistoryInRegion(essenceRegionId, stockedItem.TypeId);
-            //        if (typeStats.StatusCode == System.Net.HttpStatusCode.OK)
-            //        {
-            //            break;
-            //        }
-            //        Console.WriteLine("Waiting and repeating request...");
-            //        Thread.Sleep(500);
-            //    }
-            //    Thread.Sleep(250); // be nice to the server
-            //    if (typeStats.Data.Count > 7)
-            //    {
-            //        long totalVolume = 0;
-            //        foreach (var typeStat in typeStats.Data)
-            //        {
-            //            if ((DateTime.Now - typeStat.Date).TotalDays < 7)
-            //            {
-            //                totalVolume += typeStat.Volume;
-            //            }
-            //        }
-            //        totalVolume /= 7;
-            //        if (totalVolume < 5) // at least 5 per day
-            //        {
-            //            requestedItems.Remove(stockedItem.TypeId);
-            //        }
-            //        else
-            //        {
-            //            stockedItem.VolumePerDay = (int)totalVolume;
-            //        }
-            //    }
-            //    Thread.Sleep(250); // be nice to the server
-            //}
-
-            var structOrdersResp = await esiClient.Market.StructureOrders(heydielesHqId);
-            while (structOrdersResp.StatusCode != HttpStatusCode.OK)
-            {
-                Console.WriteLine("Waiting and repeating request...");
-                Thread.Sleep(500);
-                structOrdersResp = await esiClient.Market.StructureOrders(heydielesHqId);
-            }
-            ProcessStructureOrders(requestedItems, structOrdersResp);
-            Thread.Sleep(250); // be nice to the server
-            if (structOrdersResp.Pages != null)
-            {
-                int numPages = (int)structOrdersResp.Pages;
-                for (int pageId = 2; pageId <= numPages; pageId++)
-                {
-                    structOrdersResp = await esiClient.Market.StructureOrders(heydielesHqId, pageId);
-                    while (structOrdersResp.StatusCode != HttpStatusCode.OK)
-                    {
-                        Console.WriteLine("Waiting and repeating request...");
-                        Thread.Sleep(500);
-                        structOrdersResp = await esiClient.Market.StructureOrders(heydielesHqId, pageId);
-                    }
-                    ProcessStructureOrders(requestedItems, structOrdersResp);
-                    Thread.Sleep(250); // be nice to the server
+                    requestedItems.Add(typeId, new StockedItem() { TypeId = typeId, Name = name, MinimumPrice = decimal.MaxValue, CurrentStock = 0, VolumePerDay = 0 });
                 }
             }
             conn.Close();
-
-            //if(response.StatusCode == System.Net.HttpStatusCode.OK)
-            //{
-            //    orders.AddRange(response.Data);
-            //    if(response.Pages != null)
-            //    {
-            //        int numPages = response.Pages.Value;
-            //        for(int page = 2; page <= numPages; page++)
-            //        {
-            //            for(int retry = 1; retry < 3; retry++)
-            //            {
-            //                response = await _client.Market.StructureOrders(heydielesHqId, page);
-            //                if(response.StatusCode == System.Net.HttpStatusCode.OK)
-            //                {
-            //                    break;
-            //                }
-            //                Thread.Sleep(500);
-            //            }
-            //            if(response.StatusCode != System.Net.HttpStatusCode.OK)
-            //            {
-            //                Logger.LogError("Request failed on page " + page);
-            //                return;
-            //            }
-            //        }
-            //    }
-            //}
-        }
-
-        private static void ProcessStructureOrders(Dictionary<int, StockedItem> pricePerItem, EsiResponse<List<Order>> structOrdersResp)
-        {
-            foreach (var structOrder in structOrdersResp.Data)
-            {
-                if (!structOrder.IsBuyOrder)
-                {
-                    if (pricePerItem.TryGetValue(structOrder.TypeId, out StockedItem? stockedItem) && stockedItem != null)
-                    {
-                        if (structOrder.Price < stockedItem.MinimumPrice)
-                        {
-                            stockedItem.MinimumPrice = structOrder.Price;
-                        }
-                        stockedItem.StockCount += structOrder.VolumeRemain;
-                    }
-                }
-            }
-        }
-
-        public Task StopAsync(CancellationToken cancellationToken)
-        {
-            return Task.CompletedTask;
+            return requestedItems;
         }
     }
 }
