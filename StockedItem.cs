@@ -10,7 +10,7 @@ namespace EveMarketBot
     {
         public int TypeId { get; set; }
 
-        public decimal MinimumPrice { get; set; }
+        public decimal LocalPrice { get; set; }
 
         public string Name { get; set; } = string.Empty;
 
